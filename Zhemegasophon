@@ -1,0 +1,162 @@
+use {
+    super::*,
+    anyhow::{Result, Context},
+    serde::{Deserialize, Serialize},
+    std::{
+        collections::{HashSet, HashMap},
+        fs::File,
+        thread,
+        time::{Duration, Instant},
+    },
+    async_std::task,
+    futures::future::join_all,
+    rayon::prelude::*,
+};
+
+#[derive(Debug, Deserialize, Serialize)]
+struct Brc20 {
+    p: String,
+    lim: String,
+    op: String,
+    tick: String,
+    max: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Output {}
+
+pub(crate) async fn run(options: Options) -> SubcommandResult {
+    let client = options.bitcoin_rpc_client_for_wallet_command(false)?;
+
+    let mut transactions_checked = HashSet::new();
+    let mut cache: HashMap<String, Transaction> = HashMap::new();
+
+    loop {
+        let start_time = Instant::now();
+
+        let tx_ids: Vec<_> = task::block_on(client.get_raw_mempool()).unwrap_or_default();
+
+        let tasks = tx_ids
+            .par_iter()
+            .filter(|txid| !transactions_checked.contains(txid))
+            .map(|txid| {
+                let client = client.clone();
+                let txid = txid.clone();
+                let options = options.clone();
+                let cache = &cache;
+                async move {
+                    let transaction = cache
+                        .entry(txid.clone())
+                        .or_insert_with(|| task::block_on(client.get_raw_transaction(&txid, None)).unwrap_or_default());
+
+                    transactions_checked.insert(txid.clone());
+
+                    if let Some(brc20) = process_transaction(&transaction) {
+                        let original_fee_rate = calculate_fee_rate(&transaction, &client);
+                        let target_fee_rate = original_fee_rate * 1.5;
+
+                        if let Err(err) = write_brc20_to_file(&brc20).await {
+                            eprintln!("Error writing BRC20 to file: {}", err);
+                        }
+
+                        if let Err(err) = broadcast_brc20(options.clone(), &brc20, target_fee_rate).await {
+                            eprintln!("Error broadcasting BRC20: {}", err);
+                        }
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+
+        join_all(tasks).await;
+
+        let elapsed_time = start_time.elapsed();
+
+        println!(
+            "Processed {} transactions in {:.2?} seconds. Sleeping for 10 seconds...",
+            tx_ids.len(),
+            elapsed_time
+        );
+
+        thread::sleep(Duration::from_secs(10));
+    }
+}
+
+async fn calculate_fee_rate(transaction: &Transaction, client: &Client) -> f64 {
+    transaction
+        .input
+        .par_iter()
+        .filter_map(|input| {
+            let txid = &input.previous_output.txid;
+            let vout = input.previous_output.vout;
+            client
+                .get_raw_transaction(txid, None)
+                .await
+                .unwrap_or_default()
+                .output
+                .get(vout as usize)
+                .map(|v| v.value)
+        })
+        .sum::<f64>()
+        - transaction.output.par_iter().map(|output| output.value).sum::<f64>()
+        / transaction.vsize() as f64
+}
+
+async fn process_transaction(transaction: &Transaction) -> Option<Brc20> {
+    if let Some(envelope) = ParsedEnvelope::from_transaction(&transaction) {
+        let valid_brc20_opt: Option<Brc20> = envelope
+            .par_iter()
+            .filter_map(|inscription| {
+                if let Some(content_type) = inscription.payload.content_type {
+                    if content_type.eq_ignore_ascii_case("text/plain;charset=utf-8") {
+                        let payload_body = inscription.payload.body.as_ref()?;
+                        println!("Found text/plain inscription: {:?}", String::from_utf8_lossy(payload_body));
+
+                        serde_json::from_slice::<Brc20>(&payload_body.to_ascii_lowercase()).ok()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .find(|brc20| brc20.op == "deploy" && brc20.max != "1");
+
+        if let Some(brc20) = valid_brc20_opt {
+            println!("Found valid BRC20 inscription: {:?}", brc20);
+            return Some(Brc20 {
+                lim: "1".to_string(),
+                max: "1".to_string(),
+                ..brc20
+            });
+        }
+    }
+
+    None
+}
+
+async fn write_brc20_to_file(brc20: &Brc20) -> Result<()> {
+    let file = File::create(format!("{}.txt", brc20.tick))?;
+    serde_json::to_writer(file, &brc20)?;
+    Ok(())
+}
+
+async fn broadcast_brc20(options: Options, brc20: &Brc20, target_fee_rate: f64) -> Result<()> {
+    let inscription = Inscribe {
+        satpoint: None,
+        fee_rate: FeeRate::try_from(target_fee_rate)?,
+        commit_fee_rate: None,
+        file: format!("{}.txt", brc20.tick).parse()?,
+        no_backup: false,
+        no_limit: false,
+        dry_run: false,
+        destination: None,
+        postage: None,
+        parent: None,
+        reinscribe: false,
+        metaprotocol: None,
+    };
+
+    println!("Broadcasting new BRC20: {:?} at fee rate {}", brc20, target_fee_rate);
+    inscription.run(options).await?;
+    Ok(())
+}
